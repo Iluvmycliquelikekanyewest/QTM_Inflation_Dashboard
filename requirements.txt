@@ -1,0 +1,10 @@
+pandas>=2.2
+numpy>=1.26
+fredapi>=0.5
+beapy
+python-dotenv
+requests
+streamlit>=1.35
+plotly>=5.22
+ttkbootstrap; platform_system!="Darwin"
+matplotlib>=3.8
