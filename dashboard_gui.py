@@ -1,7 +1,10 @@
 """
 Simple Desktop GUI for the Monetary Inflation Dashboard
-Lightweight version that avoids recursion issues.
+Main GUI shell - handles UI setup and user interactions
+FIXED: Now properly passes frequency parameter to analysis engine
+UPDATED: Quarterly and Annual frequencies restricted to GDP Proxy only
 """
+
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
@@ -10,374 +13,422 @@ import threading
 import sys
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
+from dateutil.relativedelta import relativedelta
+import calendar
 import traceback
+
 
 # Add src directory to path for imports
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir / 'src'))
+
+
+# Import our analysis and results modules
+from analysis_logic import AnalysisEngine
+from results_utils import ResultsFormatter
+
 
 class SimpleMonetaryGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("💰 Monetary Inflation Dashboard")
         self.root.geometry("1000x700")
-        
+       
         # Initialize variables
         self.results_df = None
         self.analysis_running = False
-        
+       
+        # Initialize our helper modules
+        self.analysis_engine = AnalysisEngine(self)
+        self.results_formatter = ResultsFormatter(self)
+       
         self.setup_ui()
-        
+       
     def setup_ui(self):
         """Setup the user interface."""
         # Main container
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+       
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(1, weight=1)
-        
+       
         # Left panel - Controls
         self.create_controls(main_frame)
-        
+       
         # Right panel - Results
         self.create_results_area(main_frame)
-        
+       
         # Bottom panel - Log
         self.create_log_area(main_frame)
-        
+       
     def create_controls(self, parent):
-        """Create the control panel."""
+        """Create the control panel with enhanced date selection."""
         control_frame = ttk.LabelFrame(parent, text="Controls", padding="10")
         control_frame.grid(row=0, column=0, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
-        
+       
         # Title
         title_label = ttk.Label(control_frame, text="💰 Dashboard", font=('Arial', 12, 'bold'))
         title_label.pack(pady=(0, 10))
-        
-        # Date inputs
-        ttk.Label(control_frame, text="Start Date:").pack(anchor=tk.W)
-        self.start_date_var = tk.StringVar(value="2020-01-01")
-        start_entry = ttk.Entry(control_frame, textvariable=self.start_date_var, width=20)
-        start_entry.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Label(control_frame, text="End Date:").pack(anchor=tk.W)
-        self.end_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-        end_entry = ttk.Entry(control_frame, textvariable=self.end_date_var, width=20)
-        end_entry.pack(fill=tk.X, pady=(0, 10))
-        
-        # Analysis type
+       
+        # Analysis type - CREATE THIS FIRST
         ttk.Label(control_frame, text="Analysis Type:").pack(anchor=tk.W)
         self.analysis_type_var = tk.StringVar(value="GDP Proxy")
-        analysis_combo = ttk.Combobox(control_frame, textvariable=self.analysis_type_var, 
+        self.analysis_combo = ttk.Combobox(control_frame, textvariable=self.analysis_type_var,
                                     values=["GDP Proxy", "Velocity", "Inflation"], state="readonly")
-        analysis_combo.pack(fill=tk.X, pady=(0, 10))
-        
+        self.analysis_combo.pack(fill=tk.X, pady=(0, 10))
+        # Bind the analysis type change to update frequency options
+        self.analysis_combo.bind('<<ComboboxSelected>>', self.on_analysis_type_changed)
+       
+        # ENHANCED DATE SELECTION SECTION - CREATE AFTER ANALYSIS TYPE
+        self._create_date_controls(control_frame)
+       
         # SLCE option
         self.use_slce_var = tk.BooleanVar(value=True)
-        slce_check = ttk.Checkbutton(control_frame, text="Use SLCE for State/Local Gov", 
+        slce_check = ttk.Checkbutton(control_frame, text="Use SLCE for State/Local Gov",
                                    variable=self.use_slce_var)
         slce_check.pack(anchor=tk.W, pady=(0, 10))
-        
+       
         # Buttons
-        self.run_button = ttk.Button(control_frame, text="🚀 Run Analysis", command=self.run_analysis_safe)
+        self._create_action_buttons(control_frame)
+       
+        # Initialize
+        self.calculate_dates()
+       
+    def _create_date_controls(self, parent):
+        """Create the date selection controls."""
+        date_frame = ttk.LabelFrame(parent, text="📅 Time Period", padding="8")
+        date_frame.pack(fill=tk.X, pady=(0, 10))
+       
+        # Frequency selection
+        ttk.Label(date_frame, text="Frequency:").pack(anchor=tk.W)
+        self.frequency_var = tk.StringVar(value="Monthly")
+        self.frequency_combo = ttk.Combobox(date_frame, textvariable=self.frequency_var,
+                                     values=["Monthly"], state="readonly")  # Start with only Monthly
+        self.frequency_combo.pack(fill=tk.X, pady=(0, 5))
+        self.frequency_combo.bind('<<ComboboxSelected>>', self.update_period_label)
+        
+        # Update frequency options based on initial analysis type
+        self.update_frequency_options()
+       
+        # Number of periods
+        periods_frame = ttk.Frame(date_frame)
+        periods_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(periods_frame, text="Periods:").pack(side=tk.LEFT)
+        self.periods_var = tk.StringVar(value="12")
+        periods_spin = tk.Spinbox(periods_frame, from_=1, to=60, width=8, textvariable=self.periods_var)
+        periods_spin.pack(side=tk.LEFT, padx=(5, 5))
+        self.period_label_var = tk.StringVar(value="months")
+        ttk.Label(periods_frame, textvariable=self.period_label_var).pack(side=tk.LEFT)
+       
+        # End date selection (Year and Month only)
+        self._create_end_date_controls(date_frame)
+       
+        # Calculated range display
+        self.range_var = tk.StringVar()
+        range_label = ttk.Label(date_frame, textvariable=self.range_var, foreground='blue', font=('Arial', 8))
+        range_label.pack(pady=(5, 0))
+       
+        ttk.Button(date_frame, text="Update Range", command=self.calculate_dates).pack(pady=(2, 0))
+    
+    def on_analysis_type_changed(self, event=None):
+        """Handle analysis type change to update frequency options."""
+        self.update_frequency_options()
+        self.update_period_label()  # Update the period label and defaults
+        
+    def update_frequency_options(self):
+        """Update frequency options based on selected analysis type."""
+        analysis_type = self.analysis_type_var.get()
+        
+        if analysis_type == "GDP Proxy":
+            # GDP Proxy allows all frequencies
+            available_frequencies = ["Monthly", "Quarterly", "Annually"]
+        else:
+            # Velocity and Inflation only allow Monthly
+            available_frequencies = ["Monthly"]
+            # Force Monthly if user had selected something else
+            if self.frequency_var.get() not in available_frequencies:
+                self.frequency_var.set("Monthly")
+        
+        # Update the combobox values
+        self.frequency_combo['values'] = available_frequencies
+        
+        # Log the change if we have a log area
+        if hasattr(self, 'log_text') and analysis_type in ["Velocity", "Inflation"]:
+            self.log_message(f"ℹ️ {analysis_type} analysis only supports Monthly frequency")
+       
+    def _create_end_date_controls(self, parent):
+        """Create end date selection controls."""
+        end_frame = ttk.Frame(parent)
+        end_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(end_frame, text="End:").pack(side=tk.LEFT)
+       
+        now = datetime.now()
+        current_year = now.year
+        current_month = now.month
+       
+        self.end_year_var = tk.StringVar(value=str(current_year))
+        year_combo = ttk.Combobox(end_frame, textvariable=self.end_year_var,
+                                values=[str(y) for y in range(2015, current_year + 2)],
+                                state="readonly", width=8)
+        year_combo.pack(side=tk.LEFT, padx=(5, 5))
+       
+        month_names = [calendar.month_name[i] for i in range(1, 13)]
+        self.end_month_var = tk.StringVar(value=calendar.month_name[current_month])
+        month_combo = ttk.Combobox(end_frame, textvariable=self.end_month_var,
+                                 values=month_names, state="readonly", width=10)
+        month_combo.pack(side=tk.LEFT)
+       
+    def _create_action_buttons(self, parent):
+        """Create action buttons using a loop for DRY principle."""
+        # Main action button
+        self.run_button = ttk.Button(parent, text="🚀 Run Analysis", command=self.run_analysis_safe)
         self.run_button.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Button(control_frame, text="📁 Load Cache", command=self.load_cache).pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(control_frame, text="💾 Export", command=self.export_data).pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(control_frame, text="🗑️ Clear Log", command=self.clear_log).pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(control_frame, text="🚪 Exit", command=self.root.quit).pack(fill=tk.X, pady=(10, 0))
-        
+       
+        # Other buttons configuration
+        buttons_config = [
+            ("📁 Load Cache", self.load_cache),
+            ("💾 Export", self.export_data),
+            ("🗑️ Clear Log", self.clear_log),
+            ("🚪 Exit", self.root.quit)
+        ]
+       
+        for i, (text, command) in enumerate(buttons_config):
+            pady = (10, 0) if i == len(buttons_config) - 1 else (0, 5)  # Extra padding for Exit button
+            ttk.Button(parent, text=text, command=command).pack(fill=tk.X, pady=pady)
+       
+    def update_period_label(self, event=None):
+        """Update period label when frequency changes."""
+        freq = self.frequency_var.get()
+        period_configs = {
+            "Monthly": ("months", "12"),
+            "Quarterly": ("quarters", "8"),
+            "Annually": ("years", "5")
+        }
+       
+        if freq in period_configs:
+            label, default_periods = period_configs[freq]
+            self.period_label_var.set(label)
+            self.periods_var.set(default_periods)
+           
+        self.calculate_dates()
+       
+    def get_last_complete_quarter_end(self, reference_date):
+        """Get the end date of the last complete quarter relative to reference date."""
+        # Quarter end months: March (Q1), June (Q2), September (Q3), December (Q4)
+        quarter_end_months = [3, 6, 9, 12]
+       
+        # Find the last quarter end that has passed
+        for quarter_end_month in reversed(quarter_end_months):
+            quarter_end_date = date(reference_date.year, quarter_end_month,
+                                  calendar.monthrange(reference_date.year, quarter_end_month)[1])
+           
+            # Check if this quarter end is at least 45 days ago (to ensure data availability)
+            if (reference_date - quarter_end_date).days >= 45:
+                return quarter_end_date
+       
+        # If no quarter in current year is complete, go to Q4 of previous year
+        prev_year = reference_date.year - 1
+        return date(prev_year, 12, 31)
+       
+    def _get_monthly_range(self, selected_end_date, periods, today):
+        """Calculate date range for monthly frequency."""
+        end_date = min(selected_end_date, today.replace(day=1) - relativedelta(days=1))
+        start_date = end_date - relativedelta(months=periods-1)
+        start_date = start_date.replace(day=1)
+        return start_date, end_date
+       
+    def _get_quarterly_range(self, selected_end_date, end_year, end_month, periods, today):
+        """Calculate date range for quarterly frequency."""
+        last_complete_quarter = self.get_last_complete_quarter_end(today)
+       
+        # If user selected a date after the last complete quarter, use complete quarter
+        if selected_end_date > last_complete_quarter:
+            end_date = last_complete_quarter
+            self.log_message(f"ℹ️ Adjusted end date to last complete quarter: {end_date}")
+        else:
+            # Use the selected quarter end
+            quarter = ((end_month - 1) // 3) + 1
+            quarter_end_month = quarter * 3
+            end_date = date(end_year, quarter_end_month,
+                           calendar.monthrange(end_year, quarter_end_month)[1])
+       
+        # Calculate start date by going back the requested number of quarters
+        start_quarter_end = end_date - relativedelta(months=(periods-1)*3)
+        # Adjust to quarter end
+        start_quarter = ((start_quarter_end.month - 1) // 3) + 1
+        start_quarter_end_month = start_quarter * 3
+        start_date = date(start_quarter_end.year, start_quarter_end_month, 1)
+       
+        return start_date, end_date
+       
+    def _get_annual_range(self, selected_end_date, end_year, periods, today):
+        """Calculate date range for annual frequency."""
+        if selected_end_date.year >= today.year:
+            end_date = date(today.year - 1, 12, 31)
+        else:
+            end_date = date(end_year, 12, 31)
+       
+        start_date = date(end_date.year - periods + 1, 1, 1)
+        return start_date, end_date
+       
+    def calculate_dates(self):
+        """Calculate start/end dates based on frequency selection with improved logic."""
+        try:
+            # 🚨 DEBUG: Add these lines at the very beginning
+            print(f"🚨 calculate_dates() called!")
+            print(f"🚨 End year var: {self.end_year_var.get()}")
+            print(f"🚨 End month var: {self.end_month_var.get()}")
+            print(f"🚨 Frequency var: {self.frequency_var.get()}")
+            print(f"🚨 Periods var: {self.periods_var.get()}")
+            
+            # Also log to GUI (if log_text exists)
+            if hasattr(self, 'log_text'):
+                self.log_message(f"🚨 calculate_dates() called! Year: {self.end_year_var.get()}, Month: {self.end_month_var.get()}")
+            
+            # Get selected end date
+            end_year = int(self.end_year_var.get())
+            end_month = list(calendar.month_name).index(self.end_month_var.get())
+            selected_end_date = date(end_year, end_month, calendar.monthrange(end_year, end_month)[1])
+            
+            # 🚨 DEBUG: Add these lines after calculating selected_end_date
+            print(f"🚨 Calculated end_year: {end_year}")
+            print(f"🚨 Calculated end_month: {end_month}")
+            print(f"🚨 Calculated selected_end_date: {selected_end_date}")
+            
+            # Also log to GUI (if log_text exists)
+            if hasattr(self, 'log_text'):
+                self.log_message(f"🚨 Calculated end date: {selected_end_date}")
+           
+            freq = self.frequency_var.get()
+            periods = int(self.periods_var.get())
+            today = datetime.now().date()
+           
+            # Use helper methods for each frequency
+            if freq == "Monthly":
+                self.start_date, self.end_date = self._get_monthly_range(selected_end_date, periods, today)
+            elif freq == "Quarterly":
+                self.start_date, self.end_date = self._get_quarterly_range(
+                    selected_end_date, end_year, end_month, periods, today)
+            else:  # Annually
+                self.start_date, self.end_date = self._get_annual_range(
+                    selected_end_date, end_year, periods, today)
+            
+            # 🚨 DEBUG: Add these lines after calculating final dates
+            print(f"🚨 FINAL start_date: {self.start_date}")
+            print(f"🚨 FINAL end_date: {self.end_date}")
+            
+            # Also log to GUI (if log_text exists)
+            if hasattr(self, 'log_text'):
+                self.log_message(f"🚨 FINAL date range: {self.start_date} → {self.end_date}")
+           
+            # Update display with more informative text
+            self._update_range_display(freq)
+            
+            # 🚨 DEBUG: Check what the display shows (if log_text exists)
+            print(f"🚨 Display text: {self.range_var.get()}")
+            if hasattr(self, 'log_text'):
+                self.log_message(f"🚨 Display text: {self.range_var.get()}")
+           
+        except (ValueError, AttributeError) as e:
+            print(f"🚨 ERROR in calculate_dates(): {e}")
+            if hasattr(self, 'log_text'):
+                self.log_message(f"🚨 ERROR in calculate_dates(): {e}")
+            self.range_var.set(f"Invalid selection: {e}")
+            self.start_date = None
+            self.end_date = None
+           
+    def _update_range_display(self, freq):
+        """Update the range display with calculated dates."""
+        months = (self.end_date.year - self.start_date.year) * 12 + (self.end_date.month - self.start_date.month) + 1
+       
+        if freq == "Quarterly":
+            quarters = ((self.end_date.year - self.start_date.year) * 4 +
+                      ((self.end_date.month - 1) // 3) - ((self.start_date.month - 1) // 3) + 1)
+            self.range_var.set(f"{self.start_date} → {self.end_date} ({quarters} quarters, {months} months)")
+        elif freq == "Annually":
+            years = self.end_date.year - self.start_date.year + 1
+            self.range_var.set(f"{self.start_date} → {self.end_date} ({years} years, {months} months)")
+        else:
+            self.range_var.set(f"{self.start_date} → {self.end_date} ({months} months)")
+           
     def create_results_area(self, parent):
         """Create the results area."""
         results_frame = ttk.LabelFrame(parent, text="Results", padding="10")
         results_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
         results_frame.columnconfigure(0, weight=1)
         results_frame.rowconfigure(0, weight=1)
-        
+       
         # Create notebook for tabs
         notebook = ttk.Notebook(results_frame)
         notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+       
         # Summary tab
         self.summary_frame = ttk.Frame(notebook)
         notebook.add(self.summary_frame, text="📊 Summary")
-        
+       
         self.summary_text = scrolledtext.ScrolledText(self.summary_frame, height=15, wrap=tk.WORD)
         self.summary_text.pack(fill=tk.BOTH, expand=True)
-        
+       
         # Data tab
         self.data_frame = ttk.Frame(notebook)
         notebook.add(self.data_frame, text="📋 Data")
-        
+       
         self.data_text = scrolledtext.ScrolledText(self.data_frame, height=15, wrap=tk.NONE)
         self.data_text.pack(fill=tk.BOTH, expand=True)
-        
+       
     def create_log_area(self, parent):
         """Create the log area."""
         log_frame = ttk.LabelFrame(parent, text="Analysis Log", padding="5")
         log_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        
+       
         self.log_text = scrolledtext.ScrolledText(log_frame, height=8, wrap=tk.WORD)
         self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+       
     def log_message(self, message):
         """Add a message to the log."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now()
+        timestamp = now.strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
         self.root.update_idletasks()
-        
+       
     def run_analysis_safe(self):
-        """Run analysis in a thread to prevent GUI freezing."""
+        """Run analysis in a thread to prevent GUI freezing - FIXED with frequency parameter."""
         if self.analysis_running:
             messagebox.showwarning("Analysis Running", "Analysis is already running. Please wait.")
             return
-            
+           
+        if not hasattr(self, 'start_date') or not self.start_date:
+            messagebox.showerror("Invalid Dates", "Please update the date range first.")
+            return
+           
         # Disable button
         self.run_button.config(state='disabled', text="⏳ Running...")
         self.analysis_running = True
-        
-        # Start analysis in thread
-        thread = threading.Thread(target=self.run_analysis_thread, daemon=True)
-        thread.start()
-        
-    def run_analysis_thread(self):
-        """Run the analysis in a separate thread."""
-        try:
-            self.log_message("🚀 Starting analysis...")
-            
-            # Import here to avoid circular imports
-            from src.data_fetch import get_fred_gdp_components, get_bea_gdp_shares
-            from src.gdp_proxy import build_gdp_proxy
-            from src.velocity import calc_velocity
-            from src.weight_manager import prev_qtr_shares, shares_monthly
-            from src.config import Config
-            
-            # Validate inputs
-            start_str = self.start_date_var.get()
-            end_str = self.end_date_var.get()
-            analysis_type = self.analysis_type_var.get()
-            use_slce = self.use_slce_var.get()
-            
-            # Validate dates
-            try:
-                start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-                end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
-                if start_date >= end_date:
-                    raise ValueError("Start date must be before end date")
-            except ValueError as e:
-                self.log_message(f"❌ Date error: {e}")
-                return
-            
-            # Check lag needed (simple check)
-            today = datetime.now().date()
-            lag_quarters = 1 if (today - end_date).days < 90 else 0
-            
-            if lag_quarters > 0:
-                self.log_message(f"⚠️ Using {lag_quarters}Q lag due to recent end date")
-            
-            # Step 1: Fetch data
-            self.log_message("📊 Fetching FRED data...")
-            fred_data = get_fred_gdp_components(start_date=start_str)
-            self.log_message(f"✅ Got {len(fred_data)} FRED observations")
-            
-            self.log_message("📈 Fetching BEA shares...")
-            bea_shares = get_bea_gdp_shares()
-            self.log_message(f"✅ Got {len(bea_shares)} BEA observations")
-            
-            # Step 2: Create weights
-            self.log_message("⚖️ Creating monthly weights...")
-            lagged_shares = prev_qtr_shares(bea_shares, lag_quarters=lag_quarters)
-            monthly_weights = shares_monthly(lagged_shares, method='ffill')
-            self.log_message(f"✅ Created {len(monthly_weights)} monthly weights")
-            
-            # Step 3: Build GDP proxy
-            self.log_message("🏗️ Building GDP proxy...")
-            gdp_proxy_df = build_gdp_proxy(
-                start_date=start_str, 
-                export=True, 
-                strict=False, 
-                use_slce=use_slce
-            )
-            self.log_message(f"✅ Built GDP proxy with {len(gdp_proxy_df)} observations")
-            
-            # Step 4: Calculate velocity if requested
-            if analysis_type in ["Velocity", "Inflation"]:
-                self.log_message("💰 Calculating velocity...")
-                if 'GDP_proxy' in gdp_proxy_df.columns and 'M2' in fred_data.columns:
-                    # Align data
-                    aligned_data = pd.DataFrame({
-                        'gdp_proxy': gdp_proxy_df['GDP_proxy'],
-                        'money_supply': fred_data['M2']
-                    }).dropna()
-                    
-                    if len(aligned_data) > 0:
-                        velocity_df = calc_velocity(aligned_data['gdp_proxy'], aligned_data['money_supply'])
-                        
-                        # Combine results
-                        self.results_df = pd.concat([gdp_proxy_df, velocity_df], axis=1)
-                        self.results_df = self.results_df.loc[:, ~self.results_df.columns.duplicated()]
-                        self.log_message(f"✅ Calculated velocity for {len(velocity_df)} periods")
-                    else:
-                        self.log_message("⚠️ No overlapping data for velocity calculation")
-                        self.results_df = gdp_proxy_df
-                else:
-                    self.log_message("⚠️ Missing GDP proxy or M2 data for velocity")
-                    self.results_df = gdp_proxy_df
-            else:
-                self.results_df = gdp_proxy_df
-            
-            self.log_message("✅ Analysis completed successfully!")
-            
-            # Update results display
-            self.root.after(0, self.update_results)
-            
-        except Exception as e:
-            error_msg = f"❌ Analysis failed: {str(e)}"
-            self.log_message(error_msg)
-            self.log_message(f"Error details: {traceback.format_exc()}")
-        finally:
-            # Re-enable button
-            self.root.after(0, self.reset_button)
-            
+       
+        # CRITICAL FIX: Get frequency from GUI and pass it to analysis engine
+        selected_frequency = self.frequency_var.get()  # Get the selected frequency
+        self.log_message(f"🔄 Starting {self.analysis_type_var.get()} analysis at {selected_frequency} frequency")
+       
+        # Pass frequency to analysis engine
+        self.analysis_engine.run_analysis_threaded(frequency=selected_frequency)
+       
     def reset_button(self):
         """Reset the run button."""
         self.run_button.config(state='normal', text="🚀 Run Analysis")
         self.analysis_running = False
-        
+       
     def update_results(self):
-        """Update the results display."""
-        if self.results_df is None or self.results_df.empty:
-            self.summary_text.delete(1.0, tk.END)
-            self.summary_text.insert(tk.END, "No results to display.")
-            return
-            
-        analysis_type = self.analysis_type_var.get()
-        
-        # Update summary
-        self.summary_text.delete(1.0, tk.END)
-        self.summary_text.insert(tk.END, f"📊 {analysis_type.upper()} ANALYSIS RESULTS\n")
-        self.summary_text.insert(tk.END, "=" * 50 + "\n\n")
-        
-        # Basic info
-        self.summary_text.insert(tk.END, f"Dataset Shape: {self.results_df.shape}\n")
-        self.summary_text.insert(tk.END, f"Date Range: {self.results_df.index.min()} to {self.results_df.index.max()}\n")
-        self.summary_text.insert(tk.END, f"Available Columns: {', '.join(self.results_df.columns)}\n\n")
-        
-        # Analysis-specific metrics
-        if analysis_type == "GDP Proxy":
-            self.show_gdp_summary()
-        elif analysis_type == "Velocity":
-            self.show_velocity_summary()
-        elif analysis_type == "Inflation":
-            self.show_inflation_summary()
-            
-        # Update data tab
-        self.update_data_tab()
-        
-    def show_gdp_summary(self):
-        """Show GDP-specific summary."""
-        gdp_col = None
-        for col in self.results_df.columns:
-            if 'gdp' in col.lower() and 'proxy' in col.lower():
-                gdp_col = col
-                break
-                
-        if gdp_col:
-            latest_gdp = self.results_df[gdp_col].iloc[-1]
-            annual_gdp = latest_gdp * 12
-            self.summary_text.insert(tk.END, f"Latest Monthly GDP: ${latest_gdp:,.0f}B\n")
-            self.summary_text.insert(tk.END, f"Annualized GDP: ${annual_gdp:,.0f}B\n\n")
-            
-            if len(self.results_df) >= 12:
-                yoy_growth = (latest_gdp / self.results_df[gdp_col].iloc[-13] - 1) * 100
-                self.summary_text.insert(tk.END, f"YoY Growth: {yoy_growth:.1f}%\n")
-        
-        # Component breakdown
-        component_cols = [col for col in self.results_df.columns if col in ['C', 'I', 'G', 'NX']]
-        if component_cols:
-            latest_components = self.results_df[component_cols].iloc[-1]
-            total = latest_components.sum()
-            self.summary_text.insert(tk.END, "\nGDP Components (Latest Month):\n")
-            for comp in component_cols:
-                value = latest_components[comp]
-                share = (value / total * 100) if total > 0 else 0
-                self.summary_text.insert(tk.END, f"  {comp}: ${value:.0f}B ({share:.1f}%)\n")
-                
-    def show_velocity_summary(self):
-        """Show velocity-specific summary."""
-        velocity_cols = [col for col in self.results_df.columns if 'velocity' in col.lower()]
-        if velocity_cols:
-            velocity_col = velocity_cols[0]
-            current_velocity = self.results_df[velocity_col].iloc[-1]
-            avg_velocity = self.results_df[velocity_col].mean()
-            
-            self.summary_text.insert(tk.END, f"Current Velocity: {current_velocity:.3f}\n")
-            self.summary_text.insert(tk.END, f"Average Velocity: {avg_velocity:.3f}\n")
-            
-            if len(self.results_df) >= 12:
-                velocity_change = current_velocity - self.results_df[velocity_col].iloc[-13]
-                self.summary_text.insert(tk.END, f"YoY Change: {velocity_change:.3f}\n")
-                
-    def show_inflation_summary(self):
-        """Show inflation-specific summary."""
-        inflation_cols = [col for col in self.results_df.columns if 'inflation' in col.lower()]
-        if inflation_cols:
-            inflation_col = inflation_cols[0]
-            current_inflation = self.results_df[inflation_col].iloc[-1]
-            
-            # Handle different inflation formats
-            if abs(current_inflation) < 1:
-                inflation_pct = current_inflation * 100
-            else:
-                inflation_pct = current_inflation
-                
-            self.summary_text.insert(tk.END, f"Current Inflation: {inflation_pct:.2f}%\n")
-            
-            if len(self.results_df) >= 12:
-                past_inflation = self.results_df[inflation_col].iloc[-13]
-                if abs(past_inflation) < 1:
-                    past_pct = past_inflation * 100
-                else:
-                    past_pct = past_inflation
-                change = inflation_pct - past_pct
-                self.summary_text.insert(tk.END, f"YoY Change: {change:.2f} percentage points\n")
-                
-    def update_data_tab(self):
-        """Update the data tab."""
-        self.data_text.delete(1.0, tk.END)
-        
-        if self.results_df is None or self.results_df.empty:
-            self.data_text.insert(tk.END, "No data available.")
-            return
-            
-        # Show recent data (last 20 rows)
-        recent_data = self.results_df.tail(20)
-        
-        # Format as simple table
-        self.data_text.insert(tk.END, "Recent Data (Last 20 Observations):\n")
-        self.data_text.insert(tk.END, "=" * 80 + "\n\n")
-        
-        # Headers
-        headers = ["Date"] + list(recent_data.columns)
-        header_line = "  ".join(f"{h:<12}" for h in headers)
-        self.data_text.insert(tk.END, header_line + "\n")
-        self.data_text.insert(tk.END, "-" * len(header_line) + "\n")
-        
-        # Data rows
-        for idx, row in recent_data.iterrows():
-            date_str = idx.strftime('%Y-%m-%d')
-            values = [date_str] + [f"{val:.2f}" if pd.notna(val) else "N/A" for val in row]
-            value_line = "  ".join(f"{v:<12}" for v in values)
-            self.data_text.insert(tk.END, value_line + "\n")
-            
+        """Delegate to results formatter."""
+        self.results_formatter.update_results()
+           
     def load_cache(self):
         """Load cached results."""
         try:
@@ -391,20 +442,20 @@ class SimpleMonetaryGUI:
         except Exception as e:
             self.log_message(f"❌ Error loading cache: {e}")
             messagebox.showerror("Load Error", f"Failed to load cache: {e}")
-            
+           
     def export_data(self):
         """Export results to file."""
         if self.results_df is None or self.results_df.empty:
             messagebox.showwarning("No Data", "No results to export.")
             return
-            
+           
         try:
             filename = filedialog.asksaveasfilename(
                 defaultextension=".csv",
                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
                 title="Export Results"
             )
-            
+           
             if filename:
                 self.results_df.to_csv(filename)
                 self.log_message(f"✅ Exported to {filename}")
@@ -412,10 +463,12 @@ class SimpleMonetaryGUI:
         except Exception as e:
             self.log_message(f"❌ Export error: {e}")
             messagebox.showerror("Export Error", f"Failed to export: {e}")
-            
+           
     def clear_log(self):
         """Clear the log display."""
         self.log_text.delete(1.0, tk.END)
+
+
 
 
 def main():
@@ -432,18 +485,18 @@ def main():
             messagebox.showerror("Configuration Error", f"API keys not configured:\n{e}")
             root.destroy()
             return
-        
+       
         # Create and run GUI
         root = tk.Tk()
         app = SimpleMonetaryGUI(root)
-        
+       
         # Closing protocol
         def on_closing():
             if messagebox.askokcancel("Quit", "Do you want to quit the dashboard?"):
                 root.destroy()
-        
+       
         root.protocol("WM_DELETE_WINDOW", on_closing)
-        
+       
         # Center window
         root.update_idletasks()
         width = 1000
@@ -451,15 +504,17 @@ def main():
         x = (root.winfo_screenwidth() // 2) - (width // 2)
         y = (root.winfo_screenheight() // 2) - (height // 2)
         root.geometry(f"{width}x{height}+{x}+{y}")
-        
+       
         # Start GUI
         print("🚀 Starting Simple Desktop GUI...")
         root.mainloop()
         print("👋 Desktop GUI closed")
-        
+       
     except Exception as e:
         print(f"❌ Error starting GUI: {e}")
         traceback.print_exc()
+
+
 
 
 if __name__ == "__main__":
